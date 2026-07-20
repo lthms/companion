@@ -37,6 +37,11 @@ type nvimRegisterParams struct {
 	Endpoint string `json:"endpoint" validate:"required"`
 }
 
+type emacsRegisterParams struct {
+	Socket string `json:"socket" validate:"required"`
+	Root   string `json:"root" validate:"required"`
+}
+
 type registerRequest struct {
 	PID    int
 	Server AppMCPSever
@@ -58,6 +63,13 @@ func (req *registerRequest) UnmarshalJSON(data []byte) error {
 		}
 
 		req.Server = &NvimMCPServer{endpoint: params.Endpoint}
+	case Emacs:
+		var params emacsRegisterParams
+		if err := json.Unmarshal(data, &params); err != nil {
+			return err
+		}
+
+		req.Server = &EmacsMCPServer{socket: params.Socket, root: params.Root}
 	}
 
 	return nil
