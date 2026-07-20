@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -27,14 +28,36 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	srv := &http.Server{Addr: fmt.Sprintf(":%d", cli.Port), Handler: newRPCHandler()}
+	ln, err := listen()
+	if err != nil {
+		slog.Error("cannot listen", "err", err)
+		os.Exit(1)
+	}
+
+	srv := &http.Server{Handler: newRPCHandler()}
 	context.AfterFunc(ctx, func() { _ = srv.Shutdown(context.Background()) })
 
-	slog.Info("sidekick server listening", "addr", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	slog.Info("sidekick server listening", "addr", ln.Addr())
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		slog.Error("server stopped", "err", err)
 		os.Exit(1)
 	}
+}
+
+// listen returns the socket to serve on. Under systemd socket activation,
+// systemd binds the socket, passes it as the first descriptor (systemd's
+// SD_LISTEN_FDS_START is 3), and sets LISTEN_PID/LISTEN_FDS; adopting that
+// listener means :8000 is accepting the instant `systemctl start' returns, so
+// the editor's `register' can never race the bind (systemd queues the
+// connection until we accept). Run standalone (`./sidekick'), no descriptors
+// are passed and we bind cli.Port ourselves, as before.
+func listen() (net.Listener, error) {
+	if os.Getenv("LISTEN_PID") == strconv.Itoa(os.Getpid()) {
+		if nfds, err := strconv.Atoi(os.Getenv("LISTEN_FDS")); err == nil && nfds >= 1 {
+			return net.FileListener(os.NewFile(3, "sidekick.socket"))
+		}
+	}
+	return net.Listen("tcp", fmt.Sprintf(":%d", cli.Port))
 }
 
 func newRPCHandler() http.Handler {
