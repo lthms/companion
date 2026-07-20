@@ -30,3 +30,12 @@ After leaving a comment starting with `REQ:`, you can use `:SidekickNotify` to
 nudge the background Claude session to read it. Sidekick exposes a MCP server
 allowing it to interact with your editor (opening, reading, writing buffers,
 etc.).
+
+### Emacs
+
+Load the Emacs plugin (see `emacs/sidekick.el`) and run `M-x sidekick-setup`.
+
+After leaving a comment starting with `REQ:`, you can use `M-x sidekick-notify`
+to nudge the background Claude session to read it. Sidekick exposes the same
+MCP server, plus a few Emacs-native tools (`xref`-based definition/reference
+lookup and buffer diagnostics).
