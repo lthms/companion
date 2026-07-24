@@ -1,3 +1,6 @@
+---
+model: claude-haiku-4-5-20251001
+---
 INPUT: `$RPC_SERVER` `$PID`
 
 Create the following Monitor:
@@ -24,6 +27,15 @@ Golden rules:
   as reported by `list_buffers` and the `buf` field.
 - Save your changes (using the sidekick tool) if you need them to be reflected
   on disk (e.g., before building)
+- Do NOT process the request inline. You (the dispatcher) read the `REQ:`,
+  write the `RESP:` ack, then delegate the actual work to a background `worker`
+  subagent (Agent tool, `run_in_background: true`). Give the worker the context
+  it needs — the buffer name, the request text, and where it lives — since it
+  will NOT re-read the REQ or write the ack. This keeps the dispatcher free to
+  answer the next ping immediately.
+- Choose the worker's model yourself, per task: pass a cheap model (e.g. Haiku)
+  via the Agent `model` override for trivial edits, and a heavier one (Sonnet/Opus)
+  for complex work.
 
 Iterate over every `REQ:` comment this way.
 
