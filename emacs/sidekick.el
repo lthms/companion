@@ -179,7 +179,7 @@ its buffer.  RESUME-ID, when non-nil, resumes that past claude session."
      "register"
      `((pid . ,id)
        (socket . ,(expand-file-name server-name server-socket-dir))
-       (editor . "emacs")
+       (app . "emacs")
        (root . ,root)))
     (let ((buffer (sidekick--spawn-claude root id resume-id)))
       (puthash root
@@ -271,6 +271,53 @@ Prefers a `summary' event, else the first user message, truncated."
       (let ((label (string-trim (or summary first-user "(no summary)"))))
         (truncate-string-to-width (replace-regexp-in-string "\n" " " label) 70)))))
 
+(defconst sidekick--entrypoint-terminal "cli"
+  "Transcript `entrypoint' of a session the user typed into directly.
+That is what `sidekick--spawn-claude-terminal' produces.")
+
+(defconst sidekick--entrypoint-dispatcher "sdk-cli"
+  "Transcript `entrypoint' of a headless dispatcher session.
+That is what `sidekick--spawn-claude-native' produces: the claude
+`sidekick--start' spawns on its own, whose whole job is to run the
+monitor bootstrap and delegate to workers.")
+
+(defun sidekick--session-entrypoint (file)
+  "The `entrypoint' recorded in the claude transcript FILE, or nil.
+Claude writes it on the session's first user record.  See
+`sidekick--entrypoint-terminal' and `sidekick--entrypoint-dispatcher'
+for the two values sidekick produces."
+  (with-temp-buffer
+    (insert-file-contents file nil 0 65536)
+    (goto-char (point-min))
+    (let (entrypoint)
+      (while (and (not entrypoint) (not (eobp)))
+        (let ((obj (ignore-errors
+                     (json-parse-string
+                      (buffer-substring-no-properties
+                       (line-beginning-position) (line-end-position))
+                      :object-type 'alist :array-type 'list :null-object nil))))
+          (let-alist obj
+            (when (stringp .entrypoint)
+              (setq entrypoint .entrypoint))))
+        (forward-line 1))
+      entrypoint)))
+
+(defun sidekick--session-label (file)
+  "Label FILE's session as \"TIME  [KIND] SUMMARY\" for the resume prompt.
+Dispatcher sessions get tagged: sidekick spawns one on every
+`sidekick--start', and they all carry the same bootstrap prompt as their
+summary, so the tag is the only thing telling them apart from a
+conversation worth resuming."
+  (format "%s  %s%s"
+          (format-time-string
+           "%Y-%m-%d %H:%M"
+           (file-attribute-modification-time (file-attributes file)))
+          (if (equal (sidekick--session-entrypoint file)
+                     sidekick--entrypoint-dispatcher)
+              "[dispatcher] "
+            "")
+          (sidekick--session-summary file)))
+
 (defun sidekick--project-sessions (root)
   "List of (LABEL . SESSION-ID) for ROOT's past claude sessions, newest first."
   (let ((dir (sidekick--claude-projects-dir root)))
@@ -281,15 +328,9 @@ Prefers a `summary' event, else the first user message, truncated."
                                          (file-attributes b))
                                         (file-attribute-modification-time
                                          (file-attributes a)))))))
-        (mapcar
-         (lambda (f)
-           (cons (format "%s  %s"
-                         (format-time-string
-                          "%Y-%m-%d %H:%M"
-                          (file-attribute-modification-time (file-attributes f)))
-                         (sidekick--session-summary f))
-                 (file-name-base f)))
-         files)))))
+        (mapcar (lambda (f)
+                  (cons (sidekick--session-label f) (file-name-base f)))
+                files)))))
 
 ;;;###autoload
 (defun sidekick-resume ()
