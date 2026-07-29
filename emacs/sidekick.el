@@ -98,13 +98,6 @@ claude terminal buffer). One Emacs — in particular a daemon shared by
 several emacsclients — hosts one project-scoped claude session per
 project.")
 
-(defconst sidekick--prompt-file
-  (expand-file-name "../plugins/emacs/commands/monitor.md"
-                    (file-name-directory (or load-file-name buffer-file-name)))
-  "Startup prompt sent to the spawned claude session.
-Shared with the /emacs:monitor slash command; `$PID' is substituted at
-spawn time.")
-
 (defvar sidekick--rpc-id 0)
 
 (defun sidekick--rpc-request (method params)
@@ -369,19 +362,12 @@ plist without depending on the internals of `sidekick--sessions'."
       (kill-buffer buffer))))
 
 (defun sidekick--claude-prompt (id)
-  "The startup prompt for claude, with $RPC_SERVER and $PID substituted.
-$RPC_SERVER becomes `sidekick-server-url' and $PID the session key ID.
-Read from the repository rather than relying on the /emacs:monitor slash
-command, which requires the emacs sidekick plugin to be installed."
-  (with-temp-buffer
-    (insert-file-contents sidekick--prompt-file)
-    (goto-char (point-min))
-    (while (search-forward "$RPC_SERVER" nil t)
-      (replace-match sidekick-server-url t t))
-    (goto-char (point-min))
-    (while (search-forward "$PID" nil t)
-      (replace-match (number-to-string id) t t))
-    (buffer-string)))
+  "The startup prompt for claude: the /emacs:monitor command for session ID.
+Claude expands the two arguments into the command's `$1' (the sidekick
+server URL) and `$2' (the session id).  This mirrors what the nvim plugin
+sends (see `lua/sidekick/init.lua'), and makes the prompt live in exactly
+one place: the emacs@sidekick plugin, which is therefore required."
+  (format "/emacs:monitor %s %d" sidekick-server-url id))
 
 (defun sidekick--mcp-config (id)
   "Write a temp MCP config file wiring session ID to the sidekick server.

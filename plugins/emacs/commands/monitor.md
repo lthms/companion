@@ -1,9 +1,9 @@
-INPUT: `$RPC_SERVER` `$PID`
+INPUT: `$1` (the sidekick server URL) `$2` (the session pid)
 
 Create the following Monitor:
 
 ```
-while true; do curl -sN $RPC_SERVER/listen/$PID || true; sleep 1; done
+while true; do curl -sN $1/listen/$2 || true; sleep 1; done
 ```
 
 /!\ You need to create a Monitor, NOT a Shell
