@@ -14,10 +14,17 @@
 ;;
 ;; so its stdout is a stream of NDJSON events and its stdin accepts NDJSON
 ;; user turns. `sidekick-render-event' consumes one parsed top-level event and
-;; appends to a `sidekick-conversation-mode' buffer: answer text inline,
-;; extended thinking in a fold that is collapsed by default, tool calls as slim
-;; header lines. Per-turn token/cost totals from the trailing `result' event
-;; drive the session's mode-line status directly, so nothing is scraped.
+;; appends to a `sidekick-conversation-mode' buffer: answer text inline, tool
+;; calls as slim header lines carrying a digest of their arguments, thinking as
+;; a marker line with the turn's thinking-token count. Per-turn token/cost
+;; totals from the trailing `result' event drive the session's mode-line status
+;; directly, so nothing is scraped.
+;;
+;; The CLI redacts reasoning content: a thinking block streams only its
+;; signature, and "thinking" is empty in the whole-message events and in the
+;; on-disk transcript alike. So there is no thinking text to fold -- what a turn
+;; is doing shows through the calls it makes, which is why tool arguments are
+;; rendered. The fold machinery stays for blocks that do carry content.
 ;;
 ;; The content-block stream is sequential -- one block starts, streams its
 ;; deltas, and stops before the next begins -- so a single "current block"
@@ -53,6 +60,10 @@
   '((t :inherit font-lock-function-name-face))
   "Face for a tool-call header line.")
 
+(defface sidekick-tool-arg-face
+  '((t :inherit shadow))
+  "Face for the argument digest trailing a tool-call header line.")
+
 (defface sidekick-footer-face
   '((t :inherit shadow))
   "Face for the faint per-turn token/cost footer.")
@@ -76,6 +87,16 @@ once the block completes.")
 
 (defvar-local sidekick--fold-content nil
   "Marker at the start of the open fold's hidden content.")
+
+(defvar-local sidekick--thinking-eol nil
+  "Marker at the end of a thinking line still awaiting its token count.")
+
+(defvar-local sidekick--tool-args nil
+  "Partial JSON of the streaming tool call's input, accumulated across deltas.")
+
+(defvar-local sidekick--tool-eol nil
+  "Marker at the end of the current tool call's header line, where its
+argument digest is appended once the block stops.")
 
 ;;; Mode -----------------------------------------------------------------------
 
@@ -122,6 +143,15 @@ reader who scrolled up is left in place."
     (dolist (w at-end)
       (set-window-point w (point-max)))))
 
+(defun sidekick--conv-insert-at (pos text &optional face)
+  "Insert TEXT (with FACE, if any) at POS, leaving the tail and point alone.
+For annotating a line already written -- a tool's arguments, a token count --
+once the stream reveals what belongs on it."
+  (let ((inhibit-read-only t))
+    (save-excursion
+      (goto-char pos)
+      (insert (if face (propertize text 'face face) text)))))
+
 ;;; Turn / block handling ------------------------------------------------------
 
 (defun sidekick-render-reset ()
@@ -131,7 +161,10 @@ reader who scrolled up is left in place."
   (setq sidekick--cur-block nil
         sidekick--answer-beg nil
         sidekick--fold-header nil
-        sidekick--fold-content nil))
+        sidekick--fold-content nil
+        sidekick--thinking-eol nil
+        sidekick--tool-args nil
+        sidekick--tool-eol nil))
 
 (defun sidekick-render-user-prompt (text)
   "Render TEXT as a user turn separating what follows from what came before."
@@ -157,7 +190,11 @@ reader who scrolled up is left in place."
       ("content_block_delta" (sidekick--block-delta .delta))
       ("content_block_stop" (sidekick--block-stop))
       ("message_start" (sidekick--set-status t nil))
-      ("message_delta" (sidekick--set-status t (let-alist .usage .output_tokens)))
+      ("message_delta"
+       (let-alist .usage
+         (sidekick--set-status t .output_tokens)
+         (sidekick--note-thinking-tokens
+          .output_tokens_details.thinking_tokens)))
       (_ nil))))
 
 (defun sidekick--block-start (block)
@@ -175,7 +212,12 @@ reader who scrolled up is left in place."
        (setq sidekick--cur-block 'tool_use)
        (unless (bolp) (sidekick--conv-insert "\n"))
        (sidekick--conv-insert (concat "→ " (or .name "tool") "\n")
-                              'sidekick-tool-face))
+                              'sidekick-tool-face)
+       ;; The name is written straight away so the line shows up the moment the
+       ;; call starts; the arguments stream in after it and get appended to the
+       ;; same line by `sidekick--tool-render-args'.
+       (setq sidekick--tool-args ""
+             sidekick--tool-eol (copy-marker (1- (point-max)))))
       (_ (setq sidekick--cur-block nil)))))
 
 (defun sidekick--block-delta (delta)
@@ -188,18 +230,76 @@ reader who scrolled up is left in place."
       ("thinking_delta"
        (when (eq sidekick--cur-block 'thinking)
          (sidekick--conv-insert .thinking 'sidekick-thinking-face)))
-      ;; input_json_delta (tool arguments) is not rendered in v1.
+      ("input_json_delta"
+       ;; Accumulated rather than rendered: the fragments are partial JSON, only
+       ;; parseable once the block stops.
+       (when (eq sidekick--cur-block 'tool_use)
+         (setq sidekick--tool-args
+               (concat sidekick--tool-args (or .partial_json "")))))
       (_ nil))))
 
 (defun sidekick--block-stop ()
-  "Finish the current block: fontify a completed answer, or close a fold."
+  "Finish the current block: fontify a completed answer, close a fold, or
+digest a tool call's arguments onto its header line."
   (pcase sidekick--cur-block
     ('text
      (when (and sidekick--answer-beg (marker-position sidekick--answer-beg))
        (sidekick--fontify-markdown sidekick--answer-beg (point-max)))
      (setq sidekick--answer-beg nil))
-    ('thinking (sidekick--fold-end)))
+    ('thinking (sidekick--fold-end))
+    ('tool_use (sidekick--tool-render-args)))
   (setq sidekick--cur-block nil))
+
+;;; Tool arguments -------------------------------------------------------------
+
+;; Claude's reasoning is redacted from the stream (see `sidekick--fold-end'), so
+;; what a turn is actually doing is only legible through the calls it makes --
+;; which is why the header line carries an argument and not just the tool name.
+
+(defconst sidekick--tool-arg-keys
+  '(command file_path path pattern query url buffer prompt description)
+  "Tool-input fields worth putting on a header line, most telling first.")
+
+(defun sidekick--tool-render-args ()
+  "Append a one-line digest of the finished tool call's input to its header."
+  (when-let ((eol (and sidekick--tool-eol (marker-position sidekick--tool-eol)))
+             (digest (sidekick--tool-digest sidekick--tool-args)))
+    (sidekick--conv-insert-at eol (concat "  " digest) 'sidekick-tool-arg-face))
+  (setq sidekick--tool-args nil
+        sidekick--tool-eol nil))
+
+(defun sidekick--tool-digest (json)
+  "The most telling field of tool-input JSON, as one short line, or nil.
+JSON may be incomplete if the block was cut off, in which case there is
+nothing to show."
+  (let* ((input (and (stringp json) (not (string-empty-p json))
+                     (ignore-errors
+                       (json-parse-string json :object-type 'alist
+                                          :array-type 'list :null-object nil))))
+         (stringy (lambda (v) (and (stringp v) (not (string-empty-p v)) v)))
+         (val (and (consp input)
+                   (or (seq-some (lambda (k) (funcall stringy (alist-get k input)))
+                                 sidekick--tool-arg-keys)
+                       ;; Unknown tool: show whatever string it did pass.
+                       (seq-some (lambda (cell) (funcall stringy (cdr cell)))
+                                 input)))))
+    (when val
+      (truncate-string-to-width
+       (string-trim (replace-regexp-in-string "[ \t\n]+" " " val))
+       72 nil nil t))))
+
+(defun sidekick--note-thinking-tokens (n)
+  "Append a count of N thinking tokens to the thinking line awaiting one.
+That count is the only quantitative trace of a thinking phase the CLI leaves;
+it arrives with `message_delta' when the message completes, so it lands just
+after the line it annotates.  N covers the whole message, so with several
+thinking blocks in one message only the last line is annotated."
+  (when (and n (> n 0) sidekick--thinking-eol
+             (marker-position sidekick--thinking-eol))
+    (sidekick--conv-insert-at (marker-position sidekick--thinking-eol)
+                              (format " · %s tokens" (sidekick--humanize n))
+                              'sidekick-fold-header-face))
+  (setq sidekick--thinking-eol nil))
 
 (defun sidekick--render-result (ev)
   "Handle the trailing `result' EV: mark idle and append a token/cost footer."
@@ -226,21 +326,35 @@ reader who scrolled up is left in place."
   (setq sidekick--fold-content (copy-marker (point-max))))
 
 (defun sidekick--fold-end ()
-  "Close the open fold, wrapping its content in a collapsed overlay."
+  "Close the open fold, wrapping its content in a collapsed overlay.
+A fold that ended up empty gets no overlay: an empty overlay carrying
+`evaporate' is deleted on the spot, which would leave a header tagged with a
+dead overlay -- TAB on it then does nothing at all, not even complain.  Its
+arrow is swapped for a flat marker instead, so the line reads as a note that
+something happened rather than as something openable.  Claude's CLI redacts
+extended thinking (only `signature_delta' arrives, never `thinking_delta'), so
+in practice that is every thinking block."
   (when (and sidekick--fold-content sidekick--fold-header)
-    (let ((ov (make-overlay sidekick--fold-content (point-max) nil t nil))
-          (inhibit-read-only t))
-      (overlay-put ov 'invisible 'sidekick-fold)
-      (overlay-put ov 'sidekick-header (copy-marker sidekick--fold-header))
-      (overlay-put ov 'evaporate t)
-      ;; Tag the whole header line so `sidekick-toggle-fold' (and a click) can
-      ;; find this overlay from anywhere on it.
-      (put-text-property sidekick--fold-header sidekick--fold-content
-                         'sidekick-fold-overlay ov)
-      (put-text-property sidekick--fold-header sidekick--fold-content
-                         'mouse-face 'highlight)
-      (put-text-property sidekick--fold-header sidekick--fold-content
-                         'keymap sidekick-fold-header-map)))
+    (let ((inhibit-read-only t))
+      (if (= sidekick--fold-content (point-max))
+          (let ((beg (marker-position sidekick--fold-header)))
+            (subst-char-in-region beg (1+ beg) ?▸ ?…)
+            ;; Remember where the line ends so the turn's thinking-token count
+            ;; can be appended to it once `message_delta' reports one.
+            (setq sidekick--thinking-eol
+                  (copy-marker (1- (marker-position sidekick--fold-content)))))
+        (let ((ov (make-overlay sidekick--fold-content (point-max) nil t nil)))
+          (overlay-put ov 'invisible 'sidekick-fold)
+          (overlay-put ov 'sidekick-header (copy-marker sidekick--fold-header))
+          (overlay-put ov 'evaporate t)
+          ;; Tag the whole header line so `sidekick-toggle-fold' (and a click)
+          ;; can find this overlay from anywhere on it.
+          (put-text-property sidekick--fold-header sidekick--fold-content
+                             'sidekick-fold-overlay ov)
+          (put-text-property sidekick--fold-header sidekick--fold-content
+                             'mouse-face 'highlight)
+          (put-text-property sidekick--fold-header sidekick--fold-content
+                             'keymap sidekick-fold-header-map)))))
   (setq sidekick--fold-header nil
         sidekick--fold-content nil))
 
