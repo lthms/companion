@@ -6,6 +6,11 @@
       "name": "nvim",
       "source": "./plugins/nvim",
       "description": "sidekick for neovim"
+    },
+    {
+      "name": "emacs",
+      "source": "./plugins/emacs",
+      "description": "sidekick for emacs"
     }
   ]
 }
