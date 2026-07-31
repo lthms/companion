@@ -11,22 +11,47 @@ M.state = {}
 
 local rpc_id = 0
 
-local function stop_claude()
-  -- A terminal buffer exposes its PTY job as the buffer-local variable
-  -- `terminal_job_id`. Send the raw Ctrl-C byte (ETX, "\003") to that channel
+local function claude_job()
   local buf = M.state.claude_buff
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
-    vim.print("No Claude session to interrupt")
+    vim.print("No Claude session")
     return
   end
 
+  -- A terminal buffer exposes its PTY job as the buffer-local variable
+  -- `terminal_job_id`.
   local ok, job = pcall(vim.api.nvim_buf_get_var, buf, "terminal_job_id")
   if not ok or not job then
-    vim.print("No Claude session to interrupt")
+    vim.print("No Claude session")
     return
   end
 
-  vim.fn.chansend(job, "\003")
+  return job
+end
+
+local function send_claude(data)
+  local job = claude_job()
+  if job then
+    vim.fn.chansend(job, data)
+  end
+end
+
+local function inject_user_prompt(prompt, kont)
+  send_claude(prompt)
+  -- Claude TUI has autocomplete features and sending <Enter> too quickly may
+  -- mess with the prompt if sent too quickly. So we wait a little just in
+  -- case.
+  vim.defer_fn(function()
+    send_claude("\r")
+    if kont ~= nil then
+      kont()
+    end
+  end, 300)
+end
+
+local function stop_claude()
+  -- Sending the raw Ctrl-C byte (ETX, "\003") to claude
+  send_claude("\003")
 end
 
 function M.write_buf(buf, start, previous_content, new_content)
@@ -86,6 +111,7 @@ local function spawn_terminal(mcp_config, pid)
         {
           "claude", "--mcp-config", mcp_config,
           "--allowedTools", "mcp__sidekick",
+          "--model", M.config.claude.default_model,
           "--", "/nvim:monitor " .. M.config.server_url .. " " .. pid
         },
         { term = true }
@@ -159,6 +185,14 @@ local function on_start()
   end)
 end
 
+local function change_model(o)
+  inject_user_prompt("/model " .. o.args, function()
+    -- Waiting a little then sending <Enter> again, which is necessary to
+    -- accept the “Switch model” modal
+    vim.defer_fn(function() send_claude("\r") end, 300)
+  end)
+end
+
 local function on_buf_write()
   local buf = vim.api.nvim_get_current_buf()
   local file = vim.api.nvim_buf_get_name(buf)
@@ -170,6 +204,7 @@ end
 local defaults = {
   server_url = "http://127.0.0.1:8000",
   claude = {
+    default_model = "opus",
     auto_install = true,
     marketplace = {
       path = nil,
@@ -194,6 +229,10 @@ function M.setup(opts)
   })
   vim.api.nvim_create_user_command("SidekickRestart", restart_claude, {
     desc = "Restart the background Claude Code session from scratch"
+  })
+  vim.api.nvim_create_user_command("SidekickModel", change_model, {
+    nargs = "+",
+    desc = "Request a change of model for Claude"
   })
 end
 
