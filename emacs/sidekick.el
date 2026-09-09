@@ -1007,6 +1007,44 @@ in another window, routed like `sidekick-notify' and `sidekick-prompt'."
                  (sidekick--project-name root))
       (pop-to-buffer buffer))))
 
+;;;###autoload
+(defun sidekick-list-buffers (&optional kill)
+  "Select a live claude session buffer to switch to, or KILL it.
+Lists every project with a live `*claude:NAME*' buffer across
+`sidekick--sessions' via `completing-read', keyed on project name. With
+a prefix argument, kills the chosen session's buffer and process (via
+`sidekick--kill-session') instead of switching to it."
+  (interactive "P")
+  (let (candidates)
+    (maphash (lambda (root session)
+               (when (buffer-live-p (plist-get session :buffer))
+                 (push (cons (sidekick--project-name root) session) candidates)))
+             sidekick--sessions)
+    (if (not candidates)
+        (message "sidekick: no active claude sessions")
+      (let* ((choice (completing-read (if kill "Kill claude session: "
+                                        "Switch to claude session: ")
+                                      (mapcar #'car candidates) nil t))
+             (session (cdr (assoc choice candidates))))
+        (if kill
+            (progn (sidekick--kill-session session)
+                   (message "sidekick: killed claude session for %s" choice))
+          (pop-to-buffer (plist-get session :buffer)))))))
+
+;;;###autoload
+(defun sidekick-kill-buffer ()
+  "Kill the claude session for the current buffer's project.
+Terminates the `*claude:NAME*' buffer and process via
+`sidekick--kill-session', routed like `sidekick-show-buffer'. Unlike
+`sidekick-reset', does not start a fresh session in its place."
+  (interactive)
+  (let* ((root (sidekick--project-root))
+         (session (gethash root sidekick--sessions)))
+    (if (not (and session (buffer-live-p (plist-get session :buffer))))
+        (message "sidekick: no session for %s" (sidekick--project-name root))
+      (sidekick--kill-session session)
+      (message "sidekick: killed claude session for %s" (sidekick--project-name root)))))
+
 ;;; Keybindings ----------------------------------------------------------------
 
 ;;;###autoload (autoload 'sidekick-command-map "sidekick" nil t 'keymap)
@@ -1018,6 +1056,8 @@ Bind it to a single prefix key and get the whole family at once, e.g.
 
 then `C-c s p' runs `sidekick-prompt', `C-c s n' `sidekick-notify', etc."
   "b" #'sidekick-show-buffer
+  "B" #'sidekick-list-buffers
+  "k" #'sidekick-kill-buffer
   "p" #'sidekick-prompt
   "n" #'sidekick-notify
   "s" #'sidekick-setup
